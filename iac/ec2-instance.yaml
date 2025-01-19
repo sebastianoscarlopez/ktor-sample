@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 instance for Docker deployment with enhanced security, monitoring and auto-updates'
+
+Parameters:
+  MainStackName:
+    Type: String
+    Description: Name of the main infrastructure stack
+    Default: main-infrastructure
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair for SSH access
+    Default: my-keypar
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    Description: EC2 instance type
+
+Resources:
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Path: /
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-08970251d20e940b0  # Amazon Linux 2
+      KeyName: !Ref KeyPairName
+      SubnetId: !ImportValue 
+        Fn::Sub: ${MainStackName}-SubnetId
+      SecurityGroupIds: 
+        - !ImportValue 
+          Fn::Sub: ${MainStackName}-SecurityGroupId
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: Docker Host
+        - Key: Environment
+          Value: !Ref AWS::StackName
+        - Key: Purpose
+          Value: Docker Container Host
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Enable logging of userdata script
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          # Update system
+          yum update -y
+          
+          # Install required packages
+          yum install -y docker
+          yum install -y amazon-cloudwatch-agent
+          
+          # Start and enable services
+          systemctl start docker
+          systemctl enable docker
+          
+          # Configure docker user permissions
+          usermod -a -G docker ec2-user
+          
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+          
+          # Create update script
+          cat <<'EOF' > /usr/local/bin/update-container.sh
+          #!/bin/bash
+          
+          # Set variables
+          REGION="${AWS::Region}"
+          ACCOUNT_ID="${AWS::AccountId}"
+          REPOSITORY="my-docker-repository"
+          TAG="latest"
+          CONTAINER_NAME="my-app"
+          IMAGE="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPOSITORY:$TAG"
+          
+          # Login to ECR
+          aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+          
+          # Get the current image ID
+          CURRENT_IMAGE_ID=$(docker inspect $CONTAINER_NAME --format '{{.Image}}' 2>/dev/null || echo "")
+          
+          # Get the latest image ID from ECR
+          NEW_IMAGE_ID=$(aws ecr batch-get-image --repository-name $REPOSITORY --image-ids imageTag=$TAG --region $REGION --query 'images[0].imageId.imageDigest' --output text)
+          
+          # If there's no container running or the image IDs are different, update the container
+          if [ -z "$CURRENT_IMAGE_ID" ] || [ "$CURRENT_IMAGE_ID" != "$NEW_IMAGE_ID" ]; then
+            echo "New image detected, updating container..."
+            
+            # Pull the latest image
+            docker pull $IMAGE
+            
+            # Stop and remove the existing container if it exists
+            docker rm -f $CONTAINER_NAME 2>/dev/null || true
+            
+            # Run the new container
+            docker run -d \
+              --name $CONTAINER_NAME \
+              --restart always \
+              -p 80:8080 \
+              $IMAGE
+            
+            echo "Container updated successfully"
+          else
+            echo "Container is up to date"
+          fi
+          EOF
+          
+          # Make the script executable
+          chmod +x /usr/local/bin/update-container.sh
+          
+          # Create cron job to check for updates every 5 minutes
+          echo "*/5 * * * * root /usr/local/bin/update-container.sh > /var/log/container-updates.log 2>&1" > /etc/cron.d/container-updates
+          
+          # Run the update script for initial deployment
+          /usr/local/bin/update-container.sh
+          
+          # Configure CloudWatch agent
+          cat <<'EOF' > /opt/aws/amazon-cloudwatch-agent/bin/config.json
+          {
+            "metrics": {
+              "metrics_collected": {
+                "disk": {
+                  "measurement": ["used_percent"],
+                  "resources": ["/"]
+                },
+                "mem": {
+                  "measurement": ["mem_used_percent"]
+                }
+              }
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/messages",
+                      "log_group_name": "${AWS::StackName}-system-logs",
+                      "log_stream_name": "{instance_id}"
+                    },
+                    {
+                      "file_path": "/var/log/docker",
+                      "log_group_name": "${AWS::StackName}-docker-logs",
+                      "log_stream_name": "{instance_id}"
+                    },
+                    {
+                      "file_path": "/var/log/container-updates.log",
+                      "log_group_name": "${AWS::StackName}-container-updates",
+                      "log_stream_name": "{instance_id}"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json
+          systemctl start amazon-cloudwatch-agent
+          systemctl enable amazon-cloudwatch-agent
+
+Outputs:
+  InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref EC2Instance
+  PublicIP:
+    Description: Public IP of EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+  PublicDNS:
+    Description: Public DNS of EC2 instance
+    Value: !GetAtt EC2Instance.PublicDnsName
+  AZone:
+    Description: Availability Zone of the instance
+    Value: !GetAtt EC2Instance.AvailabilityZone

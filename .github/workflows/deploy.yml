@@ -1,0 +1,81 @@
+name: "Deploy"
+run-name: "Deploy version: ${{ github.event.inputs.app_version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: "app version"
+        required: true
+
+permissions:
+  id-token: write # usado por OIDC
+
+env:
+  AWS_ACCOUNT_ID: 222634404649
+  AWS_ROLE_TO_ASSUME: arn:aws:iam::222634404649:role/github-flows-role
+  AWS_REGION: us-east-2
+  AWS_REPOSITORY: my-docker-repository
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set Docker tag
+        id: set-tag
+        run: echo "APP_VERSION=${{ github.event.inputs.app_version }}" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: get caller identity2
+        run: |
+          aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+          docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+      - name: Build the Docker image
+        run: |
+          docker build -t my-app:${{ env.APP_VERSION }} -f ./iac/Dockerfile .
+
+      - name: Docker images
+        run: |
+          docker images
+
+      - name: Tag the Docker image
+        run: |
+          docker tag docker.io/library/my-app:${{ env.APP_VERSION }} ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.AWS_REPOSITORY }}:${{ env.APP_VERSION }}
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.AWS_REPOSITORY }}:${{ env.APP_VERSION }}
+          - name: Check if 'latest' tag exists
+            id: check-latest
+            run: |
+              if aws ecr describe-images --repository-name ${{ env.AWS_REPOSITORY }} --image-ids imageTag=latest; then
+            echo "LATEST_TAG_EXISTS=true" >> $GITHUB_ENV
+              else
+            echo "LATEST_TAG_EXISTS=false" >> $GITHUB_ENV
+
+          - name: Remove 'latest' tag if it exists
+            if: env.LATEST_TAG_EXISTS == 'true'
+            run: |
+              aws ecr batch-delete-image --repository-name ${{ env.AWS_REPOSITORY }} --image-ids imageTag=latest
+
+          - name: Tag the new image as 'latest'
+            run: |
+              docker tag ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.AWS_REPOSITORY }}:${{ env.APP_VERSION }} 222634404649.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.AWS_REPOSITORY }}:latest
+
+          - name: Push 'latest' tag to ECR
+            run: |
+              docker push ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.AWS_REPOSITORY }}:latest
